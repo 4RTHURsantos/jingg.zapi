@@ -37,7 +37,11 @@ const SendBody = Type.Object({
         url: Type.Optional(Type.String({ format: 'uri', description: 'URL pública de onde o worker baixa o arquivo' })),
         base64: Type.Optional(Type.String({ description: 'Conteúdo em base64 (aceita prefixo data:…;base64,)' })),
       },
-      { description: 'image, video, audio, document, sticker — informe url OU base64' },
+      {
+        description:
+          'image, video, audio, document, sticker — informe url OU base64. ' +
+          'Para sticker aceita PNG, JPEG, WebP, GIF ou vídeo curto: a API converte para WebP 512×512 (animado quando a origem é).',
+      },
     ),
   ),
   caption: Type.Optional(Type.String({ description: 'image, video, document' })),
@@ -62,6 +66,16 @@ const SendBody = Type.Object({
       options: Type.Array(Type.String(), { minItems: 2, maxItems: 12 }),
       selectableCount: Type.Optional(Type.Integer({ minimum: 0, default: 1 })),
     }),
+  ),
+  sticker: Type.Optional(
+    Type.Object(
+      {
+        pack: Type.Optional(Type.String({ maxLength: 128, description: 'Nome do pacote' })),
+        author: Type.Optional(Type.String({ maxLength: 128 })),
+        emojis: Type.Optional(Type.Array(Type.String(), { maxItems: 3, description: 'Emojis associados, usados na busca de figurinhas' })),
+      },
+      { description: 'sticker: dados exibidos quando o destinatário toca na figurinha' },
+    ),
   ),
   messageId: Type.Optional(Type.String({ description: 'reaction, edit, delete: id da mensagem alvo' })),
   emoji: Type.Optional(Type.String({ description: 'reaction: emoji; string vazia remove a reação' })),

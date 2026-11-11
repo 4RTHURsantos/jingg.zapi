@@ -30,6 +30,7 @@ import { keys } from '../redis.js'
 import { presignedUrl, putObject, statObject } from '../storage.js'
 import {
   extensionFor,
+  unwrapLottie,
   normalizeMessage,
   STATUS_NAMES,
   STATUS_RANK,
@@ -38,6 +39,7 @@ import {
   type NormalizedMessage,
 } from './normalize.js'
 import { buildContent, type OutboundRow } from './outbound.js'
+import { StickerError } from './sticker.js'
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
@@ -500,7 +502,7 @@ export class Session {
         await withTimeout(
           (async () => {
             const stream = await downloadMediaMessage(
-              msg,
+              unwrapLottie(msg),
               'stream',
               {},
               { logger: this.log.child({ module: 'media' }, { level: 'warn' }) as any, reuploadRequest: sock.updateMediaMessage },
@@ -709,7 +711,7 @@ export class Session {
       metrics.sendAttemptsFailed.inc()
       const attempts = row.attempts + 1
       this.log.warn({ err: message, outboundId: row.id, attempts }, 'send failed')
-      if (err instanceof PermanentError || attempts >= config.send.maxAttempts) {
+      if (err instanceof PermanentError || err instanceof StickerError || attempts >= config.send.maxAttempts) {
         const emitted = await tx(async (client) => {
           await client.query(`UPDATE outbound_messages SET status = 'failed', last_error = $2 WHERE id = $1`, [row.id, message])
           return emitEvent(client, this.deviceId, 'message.failed', {

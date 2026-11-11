@@ -1,6 +1,8 @@
 import type { AnyMessageContent, MiscMessageGenerationOptions, WAMessage, WAMessageKey } from 'baileys'
 import { toJid } from '../jid.js'
+import { config } from '../config.js'
 import { getObjectBuffer } from '../storage.js'
+import { toSticker, type StickerMeta } from './sticker.js'
 
 /** Shape stored in outbound_messages.content; validated by the API before it is queued. */
 export interface OutboundContent {
@@ -23,6 +25,7 @@ export interface OutboundContent {
   targetFromMe?: boolean
   participant?: string
   poll?: { name: string; options: string[]; selectableCount?: number }
+  sticker?: StickerMeta
   quotedMessageId?: string
   mentions?: string[]
   mentionAll?: boolean
@@ -56,6 +59,17 @@ async function mediaSource(media: OutboundContent['media']): Promise<Buffer | { 
   if (media?.key) return getObjectBuffer(media.key)
   if (media?.url) return { url: media.url }
   throw new Error('media source missing')
+}
+
+/** Stickers are converted before sending, so unlike other media the bytes are needed here. */
+async function mediaBuffer(media: OutboundContent['media']): Promise<Buffer> {
+  if (media?.key) return getObjectBuffer(media.key)
+  if (!media?.url) throw new Error('media source missing')
+  const res = await fetch(media.url, { signal: AbortSignal.timeout(config.media.timeoutMs), redirect: 'follow' })
+  if (!res.ok) throw new Error(`could not download ${media.url}: HTTP ${res.status}`)
+  const buffer = Buffer.from(await res.arrayBuffer())
+  if (buffer.length > config.media.maxBytes) throw new Error('media is larger than MEDIA_MAX_BYTES')
+  return buffer
 }
 
 async function targetKey(row: OutboundRow, load: LoadStoredMessage): Promise<WAMessageKey> {
@@ -121,9 +135,18 @@ export async function buildContent(
         caption: c.caption,
       }
       break
-    case 'sticker':
-      content = { sticker: await mediaSource(c.media), mimetype: c.mimetype }
+    case 'sticker': {
+      const sticker = await toSticker(await mediaBuffer(c.media), c.sticker)
+      content = {
+        sticker: sticker.buffer,
+        mimetype: 'image/webp',
+        isAnimated: sticker.animated,
+        width: sticker.width,
+        height: sticker.height,
+        ...extra,
+      }
       break
+    }
     case 'location':
       content = {
         location: { degreesLatitude: c.latitude, degreesLongitude: c.longitude, name: c.name, address: c.address },

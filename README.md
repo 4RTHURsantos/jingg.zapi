@@ -36,6 +36,33 @@ curl -X POST localhost:3000/v1/devices/$ID/messages -H "x-api-key: $KEY" -H 'con
 Autenticação pelo header `x-api-key` (ou `Authorization: Bearer`). A chave de administrador acessa tudo;
 a chave de dispositivo só as rotas `/v1/devices/{id}/…` do próprio dispositivo — é a que você entrega a cada projeto.
 
+## Figurinhas
+
+`type: "sticker"` aceita PNG, JPEG, WebP, GIF ou um vídeo curto (MP4/WebM), por `media.url` ou `media.base64`.
+O worker converte para o que o WhatsApp exige — WebP 512×512 com fundo transparente, mantendo a proporção — e
+a figurinha sai **animada** quando a origem é (GIF, WebP animado ou vídeo). Um WebP que já está no padrão é
+enviado sem recompressão.
+
+```json
+{
+  "to": "5511999990000",
+  "type": "sticker",
+  "media": { "url": "https://exemplo.com/gato.gif" },
+  "sticker": { "pack": "Meu Pacote", "author": "Minha Empresa", "emojis": ["😺"] }
+}
+```
+
+- `sticker` é opcional: são os dados que aparecem quando o destinatário toca na figurinha.
+- Vídeos são cortados em `STICKER_MAX_SECONDS` (8 s) a `STICKER_FPS` (12) quadros por segundo; a conversão usa o
+  ffmpeg, que já vem na imagem Docker.
+- A qualidade é reduzida até caber em 100 KB (estática) ou 500 KB (animada). Se nem assim ficar abaixo de 1 MB,
+  ou se o arquivo não for uma imagem/vídeo, o envio falha de vez (`message.failed`), sem retentativas.
+- Figurinhas Lottie (`.was`) não podem ser enviadas.
+
+Nas recebidas, `type` é `sticker` e `media.animated` indica animação. Figurinhas Lottie chegam com
+`media.lottie: true` e o arquivo guardado é o `.was` original (não é WebP). Um pacote compartilhado chega como
+`type: "sticker_pack"`, com `stickerPack: { id, name, publisher, count }` e sem mídia.
+
 ## Bibliotecas cliente
 
 Para consumir a API sem escrever HTTP na mão — informam-se a URL e a chave:

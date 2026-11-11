@@ -10,6 +10,8 @@ export interface MediaInfo {
   height?: number
   ptt?: boolean
   animated?: boolean
+  /** vector (Lottie) sticker: the stored file is a .was archive, not a WebP */
+  lottie?: boolean
   /** pending → stored | failed | too_large | not_downloaded */
   status: string
   key?: string
@@ -37,6 +39,7 @@ export interface NormalizedMessage {
   contacts?: { name?: string; vcard?: string }[]
   poll?: { name?: string; options: string[]; selectableCount?: number }
   selection?: { id?: string; text?: string }
+  stickerPack?: { id?: string; name?: string; publisher?: string; count?: number }
   quoted?: { id: string; sender?: string }
   mentions?: string[]
   viewOnce?: boolean
@@ -85,12 +88,21 @@ export function textOf(content: proto.IMessage | undefined | null): string | und
   ) || undefined
 }
 
+/**
+ * Lottie stickers arrive wrapped in a container Baileys does not open, which would make them
+ * surface as "unknown" and fail to download.
+ */
+export function unwrapLottie(msg: WAMessage): WAMessage {
+  const inner = normalizeMessageContent(msg.message)?.lottieStickerMessage?.message
+  return inner ? { ...msg, message: inner } : msg
+}
+
 /** Returns null for anything that should not surface as a message event. */
 export function normalizeMessage(msg: WAMessage, meJid: string): NormalizedMessage | null {
   const key = msg.key
   if (!key?.remoteJid || !key.id || !msg.message) return null
 
-  const content = normalizeMessageContent(msg.message)
+  const content = normalizeMessageContent(unwrapLottie(msg).message)
   const contentType = getContentType(content)
   if (!content || !contentType || SKIPPED.has(contentType)) return null
 
@@ -136,7 +148,8 @@ export function normalizeMessage(msg: WAMessage, meJid: string): NormalizedMessa
       width: inner.width || undefined,
       height: inner.height || undefined,
       ptt: inner.ptt || undefined,
-      animated: inner.isAnimated || undefined,
+      animated: inner.isAnimated || inner.isLottie || undefined,
+      lottie: inner.isLottie || undefined,
       status: 'pending',
     }
     return out
@@ -199,6 +212,16 @@ export function normalizeMessage(msg: WAMessage, meJid: string): NormalizedMessa
       out.type = 'group_invite'
       out.text = inner.caption || inner.groupName || undefined
       break
+    case 'stickerPackMessage':
+      out.type = 'sticker_pack'
+      out.text = inner.name || undefined
+      out.stickerPack = {
+        id: inner.stickerPackId || undefined,
+        name: inner.name || undefined,
+        publisher: inner.publisher || undefined,
+        count: inner.stickers?.length || undefined,
+      }
+      break
     case 'eventMessage':
       out.type = 'event'
       out.text = inner.name || undefined
@@ -225,6 +248,7 @@ const EXTENSIONS: Record<string, string> = {
   'image/png': 'png',
   'image/webp': 'webp',
   'image/gif': 'gif',
+  'application/was': 'was',
   'video/mp4': 'mp4',
   'video/3gpp': '3gp',
   'audio/ogg': 'ogg',

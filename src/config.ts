@@ -67,6 +67,13 @@ export const config = {
     timeoutMs: int('MEDIA_DOWNLOAD_TIMEOUT_MS', 45_000),
   },
 
+  sticker: {
+    ffmpegPath: str('FFMPEG_PATH', 'ffmpeg'),
+    /** videos are cut to this length when turned into a sticker */
+    maxSeconds: int('STICKER_MAX_SECONDS', 8),
+    fps: int('STICKER_FPS', 12),
+  },
+
   send: {
     maxAttempts: int('SEND_MAX_ATTEMPTS', 5),
     intervalMs: int('SEND_INTERVAL_MS', 300),
