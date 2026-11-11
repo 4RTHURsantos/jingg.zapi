@@ -1,0 +1,137 @@
+name: jingg-zapi
+
+x-app: &app
+  build: .
+  image: jingg-zapi:latest
+  restart: unless-stopped
+  init: true
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  environment: &app-env
+    DATABASE_URL: postgres://zapi:${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}@postgres:5432/zapi
+    REDIS_URL: redis://redis:6379
+    S3_ENDPOINT: http://minio:9000
+    S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
+    S3_ACCESS_KEY: ${MINIO_ROOT_USER:?defina MINIO_ROOT_USER no .env}
+    S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?defina MINIO_ROOT_PASSWORD no .env}
+    S3_BUCKET: ${S3_BUCKET:-zapi-media}
+    ADMIN_API_KEY: ${ADMIN_API_KEY:?defina ADMIN_API_KEY no .env}
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    BAILEYS_LOG_LEVEL: ${BAILEYS_LOG_LEVEL:-warn}
+    WORKER_MAX_DEVICES: ${WORKER_MAX_DEVICES:-200}
+    LEASE_TTL_MS: ${LEASE_TTL_MS:-30000}
+    MARK_ONLINE_ON_CONNECT: ${MARK_ONLINE_ON_CONNECT:-false}
+    IGNORE_STATUS_BROADCAST: ${IGNORE_STATUS_BROADCAST:-true}
+    MEDIA_DOWNLOAD: ${MEDIA_DOWNLOAD:-true}
+    MEDIA_MAX_BYTES: ${MEDIA_MAX_BYTES:-104857600}
+    MEDIA_URL_TTL_SECONDS: ${MEDIA_URL_TTL_SECONDS:-604800}
+    SEND_MAX_ATTEMPTS: ${SEND_MAX_ATTEMPTS:-5}
+    SEND_INTERVAL_MS: ${SEND_INTERVAL_MS:-300}
+    SEND_CHECK_NUMBER: ${SEND_CHECK_NUMBER:-true}
+    WEBHOOK_MAX_ATTEMPTS: ${WEBHOOK_MAX_ATTEMPTS:-12}
+    WEBHOOK_TIMEOUT_MS: ${WEBHOOK_TIMEOUT_MS:-10000}
+    WEBHOOK_CONCURRENCY: ${WEBHOOK_CONCURRENCY:-20}
+    EVENT_RETENTION_DAYS: ${EVENT_RETENTION_DAYS:-30}
+    MESSAGE_RETENTION_DAYS: ${MESSAGE_RETENTION_DAYS:-0}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zapi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: zapi
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zapi -d zapi"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # AOF: filas sobrevivem a restart. noeviction: o Redis nunca descarta jobs por falta de memória.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    # a MinIO Inc. deixou de publicar imagens da edição community; esta é a build mantida pela comunidade (fork pgsty/minio).
+    # Qualquer storage compatível com S3 serve: basta apontar S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY.
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # roda as migrations e cria o bucket, depois encerra
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["node", "dist/migrate.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["node", "dist/api/main.js"]
+    ports:
+      - "${API_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  # mantém as conexões com o WhatsApp. Escale com: docker compose up -d --scale worker=3
+  worker:
+    <<: *app
+    command: ["node", "dist/worker/main.js"]
+    # tempo para fechar os sockets e liberar os dispositivos para outro worker
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9100/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  # entrega os webhooks
+  dispatcher:
+    <<: *app
+    command: ["node", "dist/dispatcher/main.js"]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9100/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:

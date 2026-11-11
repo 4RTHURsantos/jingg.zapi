@@ -1,0 +1,44 @@
+{
+  "name": "jingg-zapi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "API de WhatsApp multi-dispositivo sobre Baileys, com webhooks por dispositivo e entrega garantida",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migrate": "node dist/migrate.js",
+    "start:api": "node dist/api/main.js",
+    "start:worker": "node dist/worker/main.js",
+    "start:dispatcher": "node dist/dispatcher/main.js",
+    "dev:api": "tsx watch src/api/main.ts",
+    "dev:worker": "tsx watch src/worker/main.ts",
+    "dev:dispatcher": "tsx watch src/dispatcher/main.ts",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@fastify/swagger": "^9.9.3",
+    "@fastify/swagger-ui": "^6.1.3",
+    "@fastify/type-provider-typebox": "^6.3.0",
+    "@sinclair/typebox": "^0.34.52",
+    "baileys": "7.0.0-rc14",
+    "bullmq": "^6.7.4",
+    "fastify": "^5.12.8",
+    "ioredis": "^6.0.0",
+    "minio": "^8.0.7",
+    "pg": "^8.23.1",
+    "pino": "^10.4.0",
+    "prom-client": "^15.1.3",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "@types/qrcode": "^1.5.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
