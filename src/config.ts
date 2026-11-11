@@ -67,6 +67,11 @@ export const config = {
     timeoutMs: int('MEDIA_DOWNLOAD_TIMEOUT_MS', 45_000),
   },
 
+  presence: {
+    /** chats re-subscribed after each reconnect, most recently active first */
+    resubscribeLimit: int('PRESENCE_RESUBSCRIBE_LIMIT', 300),
+  },
+
   sticker: {
     ffmpegPath: str('FFMPEG_PATH', 'ffmpeg'),
     /** videos are cut to this length when turned into a sticker */

@@ -32,10 +32,11 @@ export interface DeviceRow {
   created_at: Date
   updated_at: Date
   connected_at: Date | null
+  settings: { presenceEvents?: boolean }
 }
 
 export const DEVICE_COLUMNS =
-  'id, name, desired_state, status, status_reason, wa_jid, wa_lid, wa_name, worker_id, event_seq, created_at, updated_at, connected_at'
+  'id, name, desired_state, status, status_reason, wa_jid, wa_lid, wa_name, worker_id, event_seq, created_at, updated_at, connected_at, settings'
 
 export function presentDevice(d: DeviceRow) {
   return {
@@ -53,6 +54,7 @@ export function presentDevice(d: DeviceRow) {
     createdAt: d.created_at,
     updatedAt: d.updated_at,
     connectedAt: d.connected_at,
+    settings: { presenceEvents: false, ...d.settings },
   }
 }
 

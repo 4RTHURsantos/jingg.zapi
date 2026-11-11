@@ -147,6 +147,7 @@ async function cleanup(): Promise<void> {
     await query(`DELETE FROM messages WHERE NOT pending_event AND created_at < now() - make_interval(days => $1)`, [
       config.retention.messageDays,
     ])
+    await query(`DELETE FROM message_reactions WHERE ts < now() - make_interval(days => $1)`, [config.retention.messageDays])
   }
 }
 

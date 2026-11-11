@@ -1,4 +1,6 @@
 import { Type } from '@sinclair/typebox'
+import { query } from '../../db.js'
+import { toJid } from '../../jid.js'
 import { Any, callDevice, DeviceParams } from '../context.js'
 import type { App } from '../server.js'
 
@@ -78,12 +80,32 @@ export async function contactRoutes(app: App) {
     {
       schema: {
         tags,
-        summary: 'Passa a receber `presence.update` deste contato',
+        summary: 'Passa a receber `presence.update` deste contato ou grupo',
+        description:
+          'A assinatura é lembrada e refeita a cada reconexão. O WhatsApp só envia "digitando" para contas online: ' +
+          'ligue `settings.presenceEvents` no dispositivo (que também assina sozinho cada conversa) ou envie `available` em `POST …/presence`.',
         params: JidParams,
         response: { 200: Any },
       },
     },
     async (req) => callDevice(req.device.id, 'presenceSubscribe', { jid: req.params.jid }),
+  )
+
+  app.delete(
+    '/devices/:deviceId/contacts/:jid/presence/subscribe',
+    {
+      schema: {
+        tags,
+        summary: 'Deixa de acompanhar a presença deste contato',
+        description: 'O WhatsApp não tem cancelamento: a assinatura atual dura até a próxima reconexão, e não é refeita.',
+        params: JidParams,
+        response: { 200: Any },
+      },
+    },
+    async (req) => {
+      const res = await query('DELETE FROM presence_subscriptions WHERE device_id = $1 AND jid = $2', [req.device.id, toJid(req.params.jid)])
+      return { ok: true, removed: !!res.rowCount }
+    },
   )
 
   app.post(

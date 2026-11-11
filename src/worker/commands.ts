@@ -64,7 +64,13 @@ export const commands: Record<string, Command> = {
   },
 
   async presenceSubscribe(session, { jid }) {
-    await open(session).presenceSubscribe(toJid(jid))
+    open(session)
+    await session.subscribePresence(toJid(jid))
+    return { ok: true }
+  },
+
+  async reloadSettings(session) {
+    await session.reloadSettings()
     return { ok: true }
   },
 

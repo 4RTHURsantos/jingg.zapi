@@ -66,6 +66,11 @@ async function waVersion(): Promise<WAVersion | undefined> {
   }
 }
 
+export interface DeviceSettings {
+  /** show as online and follow who is typing in every chat that writes to the device */
+  presenceEvents?: boolean
+}
+
 /** A failure that retrying cannot fix (e.g. the number has no WhatsApp account). */
 class PermanentError extends Error {}
 
@@ -85,6 +90,11 @@ export class Session {
   private backoffMs = 0
   private reconnectTimer?: NodeJS.Timeout
   private meJid = ''
+  private meLid = ''
+  private settings: DeviceSettings = {}
+  /** chats already subscribed on the current socket */
+  private presenceSubscribed = new Set<string>()
+  private lastPresence = new Map<string, { state: string; at: number }>()
   private lastStatus = ''
   private draining = false
   /** connection events and message events run on separate serial chains, so a slow media download never delays a QR code */
@@ -147,6 +157,7 @@ export class Session {
     if (this.stopped) return
     const gen = ++this.generation
     const { state, saveCreds } = await usePostgresAuthState(this.deviceId)
+    await this.loadSettings()
     const baileysLogger = this.log.child({ module: 'baileys' }, { level: config.baileysLogLevel })
     const version = await waVersion()
 
@@ -156,7 +167,8 @@ export class Session {
       // pairing-code login only works with a browser identity WhatsApp recognises
       browser: Browsers.macOS('Chrome'),
       logger: baileysLogger as any,
-      markOnlineOnConnect: config.worker.markOnlineOnConnect,
+      // typing notifications are only sent to accounts that show as online
+      markOnlineOnConnect: config.worker.markOnlineOnConnect || !!this.settings.presenceEvents,
       // recent-history sync stays on (Baileys needs it for LID mappings); history is not turned into events
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
@@ -214,6 +226,7 @@ export class Session {
       this.state = 'open'
       this.backoffMs = 0
       this.meJid = jidNormalizedUser(sock.user?.id)
+      this.meLid = sock.user?.lid ? jidNormalizedUser(sock.user.lid) : ''
       await this.redis.del(keys.qr(this.deviceId)).catch(() => {})
       await this.setStatus('connected', null, {
         jid: this.meJid,
@@ -224,6 +237,7 @@ export class Session {
       // finish anything a previous run stored but never announced, then flush the send queue
       this.msgChain = this.msgChain.then(() => this.recoverPending()).catch((err) => this.log.error({ err }, 'recovery failed'))
       void this.drain()
+      void this.restorePresence()
     }
 
     if (connection === 'close') {
@@ -355,14 +369,7 @@ export class Session {
     }
     for (const item of events['messages.reaction'] ?? []) {
       await this.guarded('messages.reaction', async () => {
-        const rk = item.reaction.key
-        await this.emit('message.reaction', {
-          messageId: item.key.id,
-          chat: item.key.remoteJid,
-          emoji: item.reaction.text || null,
-          fromMe: !!rk?.fromMe,
-          sender: rk?.fromMe ? this.meJid : (rk?.participant ?? rk?.remoteJid ?? undefined),
-        })
+        await this.applyReaction(item.key, item.reaction)
       })
     }
     for (const item of events['message-receipt.update'] ?? []) {
@@ -398,9 +405,7 @@ export class Session {
     }
     const presence = events['presence.update']
     if (presence) {
-      await this.guarded('presence.update', async () => {
-        await this.emit('presence.update', { chat: presence.id, presences: presence.presences })
-      })
+      await this.guarded('presence.update', () => this.handlePresence(presence))
     }
   }
 
@@ -409,8 +414,9 @@ export class Session {
     const key = msg.key
     if (!key?.remoteJid || !key.id) return
     if (config.worker.ignoreStatusBroadcast && isJidStatusBroadcast(key.remoteJid)) return
-    const norm = normalizeMessage(msg, this.meJid)
+    const norm = normalizeMessage(msg, this.meJid, this.meLid)
     if (!norm) return
+    if (!norm.fromMe && this.settings.presenceEvents) void this.subscribePresence(norm.chat)
 
     const result = await tx(async (client) => {
       if (norm.fromMe) {
@@ -453,6 +459,152 @@ export class Session {
     metrics.messagesReceived.inc({ type: norm.type })
     if (result.emitted) await enqueueDeliveries(result.emitted.deliveryIds)
     else await this.finalizeMedia(result.rowId, msg, norm)
+  }
+
+  // ───────────────────────────── reactions ─────────────────────────────
+
+  /**
+   * Keeps the current reaction of each person per message. Only real changes become events, so
+   * redeliveries and history replays stay silent, and a late-arriving older reaction cannot undo a newer one.
+   */
+  private async applyReaction(target: WAMessageKey, reaction: proto.IReaction): Promise<void> {
+    const rk = reaction.key
+    if (!target.id || !target.remoteJid) return
+    const fromMe = !!rk?.fromMe
+    const sender = fromMe ? this.meJid : jidNormalizedUser(rk?.participant ?? rk?.remoteJid ?? target.remoteJid)
+    const senderAlt = fromMe ? undefined : ((rk as WAMessageKey | undefined)?.participantAlt ?? (rk as WAMessageKey | undefined)?.remoteJidAlt ?? undefined)
+    const emoji = reaction.text || null
+    const millis = Number(reaction.senderTimestampMs ?? 0)
+    const at = new Date(millis > 0 ? millis : Date.now())
+
+    const emitted = await tx(async (client) => {
+      const current = await client.query(
+        `SELECT emoji, ts FROM message_reactions
+          WHERE device_id = $1 AND chat_jid = $2 AND message_id = $3 AND sender_jid = $4 FOR UPDATE`,
+        [this.deviceId, target.remoteJid, target.id, sender],
+      )
+      const previous: string | null = current.rows[0]?.emoji ?? null
+      if (previous === emoji) return null
+      if (current.rowCount && current.rows[0].ts > at) return null
+      if (emoji) {
+        await client.query(
+          `INSERT INTO message_reactions (device_id, chat_jid, message_id, sender_jid, sender_alt, from_me, emoji, ts)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (device_id, chat_jid, message_id, sender_jid)
+           DO UPDATE SET emoji = EXCLUDED.emoji, ts = EXCLUDED.ts, sender_alt = COALESCE(EXCLUDED.sender_alt, message_reactions.sender_alt)`,
+          [this.deviceId, target.remoteJid, target.id, sender, senderAlt ?? null, fromMe, emoji, at],
+        )
+      } else {
+        await client.query(
+          'DELETE FROM message_reactions WHERE device_id = $1 AND chat_jid = $2 AND message_id = $3 AND sender_jid = $4',
+          [this.deviceId, target.remoteJid, target.id, sender],
+        )
+      }
+      return emitEvent(client, this.deviceId, 'message.reaction', {
+        messageId: target.id,
+        chat: target.remoteJid,
+        messageFromMe: !!target.fromMe,
+        emoji,
+        previousEmoji: previous ?? undefined,
+        removed: !emoji,
+        fromMe,
+        sender,
+        senderAlt,
+        timestamp: at.toISOString(),
+      })
+    })
+    if (emitted) await enqueueDeliveries(emitted.deliveryIds)
+  }
+
+  // ───────────────────────────── presence ─────────────────────────────
+
+  private async loadSettings(): Promise<void> {
+    const res = await query('SELECT settings FROM devices WHERE id = $1', [this.deviceId])
+    this.settings = res.rows[0]?.settings ?? {}
+  }
+
+  /** Called when the settings change while the device is running. */
+  async reloadSettings(): Promise<void> {
+    const before = !!this.settings.presenceEvents
+    await this.loadSettings()
+    if (!this.isOpen || before === !!this.settings.presenceEvents) return
+    if (this.settings.presenceEvents) await this.restorePresence()
+    else if (!config.worker.markOnlineOnConnect) await this.sock?.sendPresenceUpdate('unavailable').catch(() => {})
+  }
+
+  /** WhatsApp forgets presence subscriptions when the socket closes, so they are replayed on every connection. */
+  private async restorePresence(): Promise<void> {
+    const sock = this.sock
+    if (!sock) return
+    this.presenceSubscribed.clear()
+    this.lastPresence.clear()
+    try {
+      if (this.settings.presenceEvents) await sock.sendPresenceUpdate('available')
+      const saved = await query('SELECT jid FROM presence_subscriptions WHERE device_id = $1 ORDER BY touched_at DESC LIMIT $2', [
+        this.deviceId,
+        config.presence.resubscribeLimit,
+      ])
+      for (const row of saved.rows) {
+        if (sock !== this.sock || !this.isOpen) return
+        await sock.presenceSubscribe(row.jid)
+        this.presenceSubscribed.add(row.jid)
+        await delay(100) // a burst of subscriptions looks like abuse
+      }
+    } catch (err: any) {
+      this.log.warn({ err: err?.message }, 'could not restore presence subscriptions')
+    }
+  }
+
+  /** Remembers the chat and asks WhatsApp for its typing/online updates. Failures are harmless: the next message tries again. */
+  async subscribePresence(jid: string): Promise<void> {
+    if (this.presenceSubscribed.has(jid)) return
+    this.presenceSubscribed.add(jid)
+    try {
+      await query(
+        `INSERT INTO presence_subscriptions (device_id, jid) VALUES ($1, $2)
+         ON CONFLICT (device_id, jid) DO UPDATE SET touched_at = now()`,
+        [this.deviceId, jid],
+      )
+      await this.sock?.presenceSubscribe(jid)
+    } catch (err: any) {
+      this.presenceSubscribed.delete(jid)
+      this.log.debug({ err: err?.message, jid }, 'presence subscribe failed')
+    }
+  }
+
+  private async handlePresence(update: BaileysEventMap['presence.update']): Promise<void> {
+    for (const [participant, data] of Object.entries(update.presences)) {
+      const state = data.lastKnownPresence
+      const cacheKey = `${update.id}|${participant}`
+      const last = this.lastPresence.get(cacheKey)
+      // WhatsApp repeats "composing" while the person keeps typing; one event per burst is enough
+      if (last && last.state === state && Date.now() - last.at < 10_000) continue
+      if (this.lastPresence.size > 5000) this.lastPresence.clear()
+      this.lastPresence.set(cacheKey, { state, at: Date.now() })
+      await this.emit('presence.update', {
+        chat: update.id,
+        chatAlt: await this.altJid(update.id),
+        participant,
+        participantAlt: participant === update.id ? undefined : await this.altJid(participant),
+        isGroup: update.id.endsWith('@g.us'),
+        state,
+        typing: state === 'composing',
+        recording: state === 'recording',
+        lastSeen: data.lastSeen ? new Date(data.lastSeen * 1000).toISOString() : undefined,
+        timestamp: new Date().toISOString(),
+      })
+    }
+  }
+
+  /** The phone-number form of a LID (or the reverse), when Baileys knows the mapping. */
+  private async altJid(jid: string): Promise<string | undefined> {
+    try {
+      const map = this.sock?.signalRepository?.lidMapping
+      if (!map) return undefined
+      if (jid.endsWith('@lid')) return (await map.getPNForLID(jid)) ?? undefined
+      if (jid.endsWith('@s.whatsapp.net')) return (await map.getLIDForPN(jid)) ?? undefined
+    } catch {}
+    return undefined
   }
 
   private eventTypeFor(norm: NormalizedMessage): EventType {

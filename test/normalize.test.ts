@@ -39,7 +39,7 @@ test('group message keeps participant, LID alt and quote', () => {
   assert.equal(n.isGroup, true)
   assert.equal(n.sender, '999@lid')
   assert.equal(n.senderAlt, '5511977776666@s.whatsapp.net')
-  assert.deepEqual(n.quoted, { id: 'Q1', sender: '111@lid' })
+  assert.deepEqual(n.quoted, { id: 'Q1', sender: '111@lid', fromMe: false })
   assert.deepEqual(n.mentions, ['222@lid'])
 })
 
@@ -92,4 +92,20 @@ test('webhook signature round-trips and rejects tampering', () => {
   assert.ok(verify('segredo', '{"a":1}', sig))
   assert.ok(!verify('segredo', '{"a":2}', sig))
   assert.ok(!verify('outro', '{"a":1}', sig))
+})
+
+test('a reply carries the author, type and text of the quoted message', () => {
+  const reply = (contextInfo: any) => normalizeMessage(base({ extendedTextMessage: { text: 'sim', contextInfo } }), ME, '777@lid')!
+
+  const toMine = reply({ stanzaId: 'Q1', participant: '5511900000000:12@s.whatsapp.net', quotedMessage: { conversation: 'Vamos?' } })
+  assert.deepEqual(toMine.quoted, { id: 'Q1', sender: ME, fromMe: true, type: 'text', text: 'Vamos?' })
+
+  const toMineByLid = reply({ stanzaId: 'Q2', participant: '777@lid', quotedMessage: { imageMessage: { caption: 'foto' } } })
+  assert.deepEqual(toMineByLid.quoted, { id: 'Q2', sender: '777@lid', fromMe: true, type: 'image', text: 'foto' })
+
+  const toTheirs = reply({ stanzaId: 'Q3', participant: '5511988887777@s.whatsapp.net', quotedMessage: { audioMessage: { ptt: true } } })
+  assert.deepEqual(toTheirs.quoted, { id: 'Q3', sender: '5511988887777@s.whatsapp.net', fromMe: false, type: 'audio', text: undefined })
+
+  const wrapped = reply({ stanzaId: 'Q4', participant: '1@lid', quotedMessage: { ephemeralMessage: { message: { stickerMessage: {} } } } })
+  assert.equal(wrapped.quoted?.type, 'sticker')
 })

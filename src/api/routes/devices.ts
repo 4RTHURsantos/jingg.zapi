@@ -25,6 +25,19 @@ import type { App } from '../server.js'
 
 const tags = ['Dispositivos']
 
+const Settings = Type.Object(
+  {
+    presenceEvents: Type.Optional(
+      Type.Boolean({
+        description:
+          'Emite `presence.update` (digitando, gravando, online) de toda conversa que escrever para o dispositivo. ' +
+          'Para isso a conta passa a aparecer online, e o celular deixa de notificar mensagens novas.',
+      }),
+    ),
+  },
+  { additionalProperties: false },
+)
+
 export async function deviceRoutes(app: App) {
   app.post(
     '/devices',
@@ -36,6 +49,7 @@ export async function deviceRoutes(app: App) {
         body: Type.Object({
           name: Type.String({ minLength: 1, maxLength: 120 }),
           connect: Type.Optional(Type.Boolean({ default: true })),
+          settings: Type.Optional(Settings),
           webhook: Type.Optional(
             Type.Object({
               url: Type.String({ format: 'uri' }),
@@ -49,13 +63,13 @@ export async function deviceRoutes(app: App) {
     },
     async (req, reply) => {
       if (!req.auth.admin) throw new HttpError(403, 'admin key required')
-      const { name, connect = true, webhook } = req.body
+      const { name, connect = true, webhook, settings = {} } = req.body
       const id = randomUUID()
       const apiKey = newApiKey()
       const device = await tx(async (client) => {
         const res = await client.query<DeviceRow>(
-          `INSERT INTO devices (id, name, api_key_hash, desired_state) VALUES ($1, $2, $3, $4) RETURNING ${DEVICE_COLUMNS}`,
-          [id, name, hashKey(apiKey), connect ? 'started' : 'stopped'],
+          `INSERT INTO devices (id, name, api_key_hash, desired_state, settings) VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING ${DEVICE_COLUMNS}`,
+          [id, name, hashKey(apiKey), connect ? 'started' : 'stopped', JSON.stringify(settings)],
         )
         if (webhook) {
           await client.query('INSERT INTO webhooks (id, device_id, url, secret, events) VALUES ($1, $2, $3, $4, $5)', [
@@ -110,17 +124,23 @@ export async function deviceRoutes(app: App) {
     {
       schema: {
         tags,
-        summary: 'Renomeia o dispositivo',
+        summary: 'Renomeia o dispositivo e/ou altera suas configurações',
+        description: 'Só os campos enviados mudam. Configurações valem na hora, sem reconectar.',
         params: DeviceParams,
-        body: Type.Object({ name: Type.String({ minLength: 1, maxLength: 120 }) }),
+        body: Type.Object({ name: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })), settings: Type.Optional(Settings) }),
         response: { 200: Any },
       },
     },
     async (req) => {
-      const res = await query<DeviceRow>(`UPDATE devices SET name = $2, updated_at = now() WHERE id = $1 RETURNING ${DEVICE_COLUMNS}`, [
-        req.device.id,
-        req.body.name,
-      ])
+      const res = await query<DeviceRow>(
+        `UPDATE devices SET name = COALESCE($2, name), settings = settings || $3::jsonb, updated_at = now()
+          WHERE id = $1 RETURNING ${DEVICE_COLUMNS}`,
+        [req.device.id, req.body.name ?? null, JSON.stringify(req.body.settings ?? {})],
+      )
+      // a stopped device picks the settings up when it connects
+      if (req.body.settings && (await isRunning(req.device.id))) {
+        await callDevice(req.device.id, 'reloadSettings', {}).catch(() => undefined)
+      }
       return presentDevice(res.rows[0])
     },
   )

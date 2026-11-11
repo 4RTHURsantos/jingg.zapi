@@ -1,4 +1,4 @@
-import { getContentType, normalizeMessageContent, proto, toNumber, type WAMessage } from 'baileys'
+import { getContentType, jidNormalizedUser, normalizeMessageContent, proto, toNumber, type WAMessage } from 'baileys'
 import { isGroupJid } from '../jid.js'
 
 export interface MediaInfo {
@@ -40,7 +40,8 @@ export interface NormalizedMessage {
   poll?: { name?: string; options: string[]; selectableCount?: number }
   selection?: { id?: string; text?: string }
   stickerPack?: { id?: string; name?: string; publisher?: string; count?: number }
-  quoted?: { id: string; sender?: string }
+  /** the message this one replies to; type and text come from the copy WhatsApp embeds in the reply */
+  quoted?: { id: string; sender?: string; fromMe?: boolean; type?: string; text?: string }
   mentions?: string[]
   viewOnce?: boolean
   forwarded?: boolean
@@ -97,8 +98,34 @@ export function unwrapLottie(msg: WAMessage): WAMessage {
   return inner ? { ...msg, message: inner } : msg
 }
 
-/** Returns null for anything that should not surface as a message event. */
-export function normalizeMessage(msg: WAMessage, meJid: string): NormalizedMessage | null {
+const SIMPLE_TYPES: Record<string, string> = {
+  conversation: 'text',
+  extendedTextMessage: 'text',
+  locationMessage: 'location',
+  liveLocationMessage: 'location',
+  contactMessage: 'contact',
+  contactsArrayMessage: 'contact',
+  pollCreationMessage: 'poll',
+  pollCreationMessageV2: 'poll',
+  pollCreationMessageV3: 'poll',
+}
+
+/** Type and visible text of a bare message content, as embedded in replies. */
+export function describeContent(message: proto.IMessage | null | undefined): { type: string; text?: string } {
+  const content = normalizeMessageContent(message?.lottieStickerMessage?.message ?? message)
+  const contentType = content ? getContentType(content) : undefined
+  if (!content || !contentType) return { type: 'unknown' }
+  const inner: any = (content as any)[contentType]
+  const type = MEDIA_TYPES[contentType] ?? SIMPLE_TYPES[contentType] ?? 'unknown'
+  const text = textOf(content) ?? (type === 'poll' || type === 'location' ? inner?.name : type === 'contact' ? inner?.displayName : undefined)
+  return { type, text: text || undefined }
+}
+
+/**
+ * Returns null for anything that should not surface as a message event.
+ * `meLid` lets replies to our own messages be recognised in LID-addressed chats.
+ */
+export function normalizeMessage(msg: WAMessage, meJid: string, meLid?: string): NormalizedMessage | null {
   const key = msg.key
   if (!key?.remoteJid || !key.id || !msg.message) return null
 
@@ -132,7 +159,15 @@ export function normalizeMessage(msg: WAMessage, meJid: string): NormalizedMessa
 
   const inner: any = (content as any)[contentType]
   const ctx: proto.IContextInfo | undefined | null = typeof inner === 'object' ? inner?.contextInfo : undefined
-  if (ctx?.stanzaId) out.quoted = { id: ctx.stanzaId, sender: ctx.participant || undefined }
+  if (ctx?.stanzaId) {
+    const author = ctx.participant ? jidNormalizedUser(ctx.participant) : undefined
+    out.quoted = {
+      id: ctx.stanzaId,
+      sender: author,
+      fromMe: author ? author === meJid || (!!meLid && author === meLid) : undefined,
+      ...(ctx.quotedMessage ? describeContent(ctx.quotedMessage) : {}),
+    }
+  }
   if (ctx?.mentionedJid?.length) out.mentions = ctx.mentionedJid
   if (ctx?.isForwarded) out.forwarded = true
 

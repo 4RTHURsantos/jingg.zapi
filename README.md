@@ -63,6 +63,47 @@ Nas recebidas, `type` é `sticker` e `media.animated` indica animação. Figurin
 `media.lottie: true` e o arquivo guardado é o `.was` original (não é WebP). Um pacote compartilhado chega como
 `type: "sticker_pack"`, com `stickerPack: { id, name, publisher, count }` e sem mídia.
 
+## Respostas, reações e "digitando"
+
+**Responder** — `POST …/messages/{id}/reply` aceita o mesmo corpo de um envio, sem `to`: o destino é a conversa da
+mensagem citada. (Também dá para mandar `quotedMessageId` num envio comum.) Quando alguém responde a uma mensagem,
+o evento traz o que foi citado:
+
+```json
+{ "type": "text", "text": "Vamos sim",
+  "quoted": { "id": "3EB0…", "sender": "5511900000000@s.whatsapp.net", "fromMe": true, "type": "text", "text": "Vamos amanhã?" } }
+```
+
+**Reagir** — `POST …/messages/{id}/reaction` com `{ "emoji": "👍" }`; `DELETE` na mesma rota remove. Cada conta tem uma
+reação por mensagem, então reagir de novo troca a anterior. A API guarda a reação atual de cada pessoa: as consultas
+de mensagens devolvem `reactions: [{ emoji, sender, senderAlt, fromMe, timestamp }]`, e cada mudança gera um
+`message.reaction` com `emoji` (nulo quando removida), `previousEmoji`, `removed`, `sender`, `fromMe` e
+`messageFromMe`. Reentregas do WhatsApp não geram evento repetido.
+
+**Digitando** — ligue `settings.presenceEvents` no dispositivo (`POST /devices` ou `PATCH /devices/{id}`):
+
+```json
+{ "settings": { "presenceEvents": true } }
+```
+
+A partir daí, toda conversa que escrever para o dispositivo passa a ser acompanhada e gera `presence.update`:
+
+```json
+{ "chat": "5511988887777@s.whatsapp.net", "participant": "5511988887777@s.whatsapp.net", "isGroup": false,
+  "state": "composing", "typing": true, "recording": false, "timestamp": "2026-11-11T12:00:00.000Z" }
+```
+
+- `state` é `composing`, `recording`, `paused`, `available` ou `unavailable`. Em grupos, `participant` é quem digita.
+- O WhatsApp só informa quem está digitando a contas **online**: com a opção ligada o número aparece online e o
+  celular deixa de notificar mensagens novas. Por isso ela vem desligada.
+- Só chegam eventos de conversas acompanhadas. Para acompanhar um contato que ainda não escreveu, use
+  `POST …/contacts/{jid}/presence/subscribe`. As assinaturas são lembradas e refeitas a cada reconexão
+  (as `PRESENCE_RESUBSCRIBE_LIMIT` mais recentes, padrão 300).
+- O WhatsApp repete "digitando" enquanto a pessoa escreve; a API emite um evento por mudança de estado. Nem sempre
+  chega um `paused` — trate "digitando" como válido por uns 20 segundos.
+- Esses eventos seguem a mesma fila dos demais, com retentativas: se o seu webhook ficar fora do ar, eles chegam
+  atrasados. Use `timestamp` para descartar os antigos.
+
 ## Bibliotecas cliente
 
 Para consumir a API sem escrever HTTP na mão — informam-se a URL e a chave:
@@ -180,7 +221,8 @@ const ok = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(req.headers
 | `message.failed` | Envio pela API esgotou as tentativas ou foi rejeitado |
 | `message.edited` / `message.deleted` / `message.reaction` / `message.poll_vote` / `message.receipt` | Alterações em mensagens |
 | `group.updated` / `group.participants` / `group.join_request` | Grupos |
-| `call.update` / `presence.update` | Chamadas e presença |
+| `call.update` | Chamadas |
+| `presence.update` | Contato digitando, gravando áudio, online (ver acima) |
 
 Um webhook pode assinar todos os eventos (padrão) ou uma lista. Cada dispositivo pode ter vários webhooks.
 
@@ -194,10 +236,10 @@ Tudo sob `/v1`, detalhado em `/docs`.
 | Área | Rotas |
 |------|-------|
 | Dispositivos | `POST/GET /devices`, `GET/PATCH/DELETE /devices/{id}`, `POST …/connect`, `…/disconnect`, `…/restart`, `…/logout`, `…/rotate-key`, `GET …/qr`, `POST …/pairing-code`, `PATCH …/profile` |
-| Mensagens | `POST …/messages` (text, image, video, audio, document, sticker, location, contact, poll, reaction, edit, delete), `GET …/messages`, `GET …/messages/{id}`, `GET …/messages/{id}/media`, `POST …/messages/read`, `GET/DELETE …/messages/outbound/{id}`, `POST …/messages/outbound/{id}/retry` |
+| Mensagens | `POST …/messages` (text, image, video, audio, document, sticker, location, contact, poll, reaction, edit, delete), `GET …/messages`, `GET …/messages/{id}`, `GET …/messages/{id}/media`, `POST …/messages/{id}/reply`, `POST/DELETE …/messages/{id}/reaction`, `POST …/messages/read`, `GET/DELETE …/messages/outbound/{id}`, `POST …/messages/outbound/{id}/retry` |
 | Webhooks | `GET/POST …/webhooks`, `PATCH/DELETE …/webhooks/{id}`, `POST …/webhooks/{id}/test`, `GET …/webhook-deliveries`, `POST …/webhook-deliveries/{id}/retry`, `POST …/webhook-deliveries/retry-failed` |
 | Eventos | `GET …/events?after=` |
-| Contatos | `POST …/contacts/check`, `GET …/contacts/{jid}/picture`, `…/status`, `…/business`, `POST …/contacts/{jid}/block`, `POST …/presence`, `POST …/calls/reject` |
+| Contatos | `POST …/contacts/check`, `GET …/contacts/{jid}/picture`, `…/status`, `…/business`, `POST …/contacts/{jid}/block`, `POST …/presence`, `POST/DELETE …/contacts/{jid}/presence/subscribe`, `POST …/calls/reject` |
 | Grupos | `GET/POST …/groups`, `GET/PATCH …/groups/{jid}`, `POST …/participants`, `GET …/invite-code`, `POST …/invite-code/revoke`, `POST …/groups/join`, `POST …/leave` |
 | Sistema | `GET /health`, `GET /ready`, `GET /metrics` (Prometheus), `GET /docs` |
 

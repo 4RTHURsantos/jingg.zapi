@@ -79,7 +79,9 @@ const SendBody = Type.Object({
   ),
   messageId: Type.Optional(Type.String({ description: 'reaction, edit, delete: id da mensagem alvo' })),
   emoji: Type.Optional(Type.String({ description: 'reaction: emoji; string vazia remove a reação' })),
-  quotedMessageId: Type.Optional(Type.String({ description: 'Responde citando esta mensagem' })),
+  quotedMessageId: Type.Optional(
+    Type.String({ description: 'Responde citando esta mensagem. Se ela não estiver no histórico da API, a mensagem sai sem a citação.' }),
+  ),
   mentions: Type.Optional(Type.Array(Type.String(), { description: 'Números/JIDs mencionados (inclua @numero no texto)' })),
   mentionAll: Type.Optional(Type.Boolean({ description: 'Grupos: menciona todos os participantes' })),
   idempotencyKey: Type.Optional(
@@ -125,6 +127,76 @@ function validate(type: string, b: any): void {
   }
 }
 
+/** The stored message a reply or reaction targets; its chat becomes the destination. */
+async function targetMessage(deviceId: string, messageId: string): Promise<{ chat: string; fromMe: boolean; sender: string | null }> {
+  const res = await query(
+    'SELECT chat_jid, from_me, sender_jid FROM messages WHERE device_id = $1 AND message_id = $2 ORDER BY id LIMIT 1',
+    [deviceId, messageId],
+  )
+  if (!res.rowCount) throw new HttpError(404, 'message not found')
+  return { chat: res.rows[0].chat_jid, fromMe: res.rows[0].from_me, sender: res.rows[0].sender_jid }
+}
+
+/** Validates and durably queues a message. Returns the HTTP status to answer with. */
+async function enqueue(
+  device: { id: string; status: string },
+  b: Record<string, any>,
+  headerKey: string | string[] | undefined,
+): Promise<{ status: 200 | 202; body: Record<string, unknown> }> {
+  const type = b.type ?? 'text'
+  validate(type, b)
+  let to: string
+  try {
+    to = toJid(b.to)
+  } catch (err: any) {
+    throw new HttpError(400, err.message)
+  }
+  const idempotencyKey = b.idempotencyKey ?? (Array.isArray(headerKey) ? headerKey[0] : headerKey) ?? null
+
+  if (idempotencyKey) {
+    const existing = await query('SELECT * FROM outbound_messages WHERE device_id = $1 AND idempotency_key = $2', [device.id, idempotencyKey])
+    if (existing.rowCount) return { status: 200, body: { ...presentOutbound(existing.rows[0]), duplicate: true } }
+  }
+
+  const id = randomUUID()
+  const { media, idempotencyKey: _k, to: _to, type: _type, ...rest } = b
+  const content: OutboundContent = { ...rest }
+  if (media?.base64) {
+    // inline payloads go to object storage so the queue row stays small
+    const match = media.base64.match(/^data:([^;,]+)[^,]*,(.*)$/s)
+    const mimetype = b.mimetype ?? match?.[1]
+    const buffer = Buffer.from(match ? match[2] : media.base64, 'base64')
+    if (!buffer.length) throw new HttpError(400, 'media.base64 is not valid base64')
+    const key = `outbound/${device.id}/${id}.${extensionFor(mimetype, b.fileName)}`
+    await putObject(key, buffer, mimetype?.split(';')[0], buffer.length)
+    content.media = { key }
+    if (mimetype && !content.mimetype) content.mimetype = mimetype
+  } else if (media?.url) {
+    content.media = { url: media.url }
+  }
+
+  const inserted = await query(
+    `INSERT INTO outbound_messages (id, device_id, to_jid, type, content, idempotency_key)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+     ON CONFLICT (device_id, idempotency_key) DO NOTHING
+     RETURNING *`,
+    [id, device.id, to, type, JSON.stringify(content), idempotencyKey],
+  )
+  if (!inserted.rowCount) {
+    // lost a race against a concurrent request with the same idempotency key
+    const existing = await query('SELECT * FROM outbound_messages WHERE device_id = $1 AND idempotency_key = $2', [device.id, idempotencyKey])
+    return { status: 200, body: { ...presentOutbound(existing.rows[0]), duplicate: true } }
+  }
+  // only a nudge: the worker also polls, so a lost publish just adds a few seconds
+  await redis.publish(channels.wake, device.id).catch(() => 0)
+  return { status: 202, body: { ...presentOutbound(inserted.rows[0]), deviceStatus: device.status } }
+}
+
+const REACTIONS_SQL = `COALESCE((
+  SELECT jsonb_agg(jsonb_build_object('emoji', r.emoji, 'sender', r.sender_jid, 'senderAlt', r.sender_alt, 'fromMe', r.from_me, 'timestamp', r.ts) ORDER BY r.ts)
+    FROM message_reactions r
+   WHERE r.device_id = m.device_id AND r.chat_jid = m.chat_jid AND r.message_id = m.message_id), '[]'::jsonb)`
+
 export async function messageRoutes(app: App) {
   app.post(
     '/devices/:deviceId/messages',
@@ -142,62 +214,71 @@ export async function messageRoutes(app: App) {
       },
     },
     async (req, reply) => {
-      const b = req.body
-      const type = b.type ?? 'text'
-      validate(type, b)
-      let to: string
-      try {
-        to = toJid(b.to)
-      } catch (err: any) {
-        throw new HttpError(400, err.message)
-      }
-      const headerKey = req.headers['idempotency-key']
-      const idempotencyKey = b.idempotencyKey ?? (Array.isArray(headerKey) ? headerKey[0] : headerKey) ?? null
-
-      if (idempotencyKey) {
-        const existing = await query('SELECT * FROM outbound_messages WHERE device_id = $1 AND idempotency_key = $2', [
-          req.device.id,
-          idempotencyKey,
-        ])
-        if (existing.rowCount) return reply.status(200).send({ ...presentOutbound(existing.rows[0]), duplicate: true })
-      }
-
-      const id = randomUUID()
-      const { media, idempotencyKey: _k, to: _to, type: _type, ...rest } = b
-      const content: OutboundContent = { ...rest }
-      if (media?.base64) {
-        // inline payloads go to object storage so the queue row stays small
-        const match = media.base64.match(/^data:([^;,]+)[^,]*,(.*)$/s)
-        const mimetype = b.mimetype ?? match?.[1]
-        const buffer = Buffer.from(match ? match[2] : media.base64, 'base64')
-        if (!buffer.length) throw new HttpError(400, 'media.base64 is not valid base64')
-        const key = `outbound/${req.device.id}/${id}.${extensionFor(mimetype, b.fileName)}`
-        await putObject(key, buffer, mimetype?.split(';')[0], buffer.length)
-        content.media = { key }
-        if (mimetype && !content.mimetype) content.mimetype = mimetype
-      } else if (media?.url) {
-        content.media = { url: media.url }
-      }
-
-      const inserted = await query(
-        `INSERT INTO outbound_messages (id, device_id, to_jid, type, content, idempotency_key)
-         VALUES ($1, $2, $3, $4, $5::jsonb, $6)
-         ON CONFLICT (device_id, idempotency_key) DO NOTHING
-         RETURNING *`,
-        [id, req.device.id, to, type, JSON.stringify(content), idempotencyKey],
-      )
-      if (!inserted.rowCount) {
-        // lost a race against a concurrent request with the same idempotency key
-        const existing = await query('SELECT * FROM outbound_messages WHERE device_id = $1 AND idempotency_key = $2', [
-          req.device.id,
-          idempotencyKey,
-        ])
-        return reply.status(200).send({ ...presentOutbound(existing.rows[0]), duplicate: true })
-      }
-      // only a nudge: the worker also polls, so a lost publish just adds a few seconds
-      await redis.publish(channels.wake, req.device.id).catch(() => 0)
-      return reply.status(202).send({ ...presentOutbound(inserted.rows[0]), deviceStatus: req.device.status })
+      const result = await enqueue(req.device, req.body, req.headers['idempotency-key'])
+      return reply.status(result.status).send(result.body)
     },
+  )
+
+  const MessageParams = Type.Object({ deviceId: Type.String({ format: 'uuid' }), messageId: Type.String() })
+
+  app.post(
+    '/devices/:deviceId/messages/:messageId/reply',
+    {
+      schema: {
+        tags,
+        summary: 'Responde a uma mensagem, citando-a',
+        description:
+          'Mesmo corpo de `POST …/messages`, sem `to`: o destino é a conversa da mensagem citada, que precisa estar no histórico da API (404 caso contrário). ' +
+          'Quem recebe uma resposta vê em `quoted` o id, o autor, o tipo e o texto da mensagem citada.',
+        params: MessageParams,
+        body: Type.Omit(SendBody, ['to', 'quotedMessageId']),
+        response: { 202: Any, 200: Any },
+      },
+    },
+    async (req, reply) => {
+      const target = await targetMessage(req.device.id, req.params.messageId)
+      const body = { ...req.body, to: target.chat, quotedMessageId: req.params.messageId }
+      const result = await enqueue(req.device, body, req.headers['idempotency-key'])
+      return reply.status(result.status).send(result.body)
+    },
+  )
+
+  const reactTo = async (req: any, reply: any, emoji: string) => {
+    const target = await targetMessage(req.device.id, req.params.messageId)
+    const body = {
+      to: target.chat,
+      type: 'reaction',
+      messageId: req.params.messageId,
+      emoji,
+      idempotencyKey: req.body?.idempotencyKey,
+    }
+    const result = await enqueue(req.device, body, req.headers['idempotency-key'])
+    return reply.status(result.status).send(result.body)
+  }
+
+  app.post(
+    '/devices/:deviceId/messages/:messageId/reaction',
+    {
+      schema: {
+        tags,
+        summary: 'Reage a uma mensagem',
+        description:
+          'Cada conta tem uma reação por mensagem: reagir de novo troca a anterior. ' +
+          'As reações atuais de uma mensagem vêm em `reactions` nas consultas de mensagens, e cada mudança gera `message.reaction`.',
+        params: MessageParams,
+        body: Type.Object({ emoji: Type.String({ minLength: 1 }), idempotencyKey: Type.Optional(Type.String({ maxLength: 200 })) }),
+        response: { 202: Any, 200: Any },
+      },
+    },
+    (req, reply) => reactTo(req, reply, req.body.emoji),
+  )
+
+  app.delete(
+    '/devices/:deviceId/messages/:messageId/reaction',
+    {
+      schema: { tags, summary: 'Remove a reação do dispositivo a uma mensagem', params: MessageParams, response: { 202: Any, 200: Any } },
+    },
+    (req, reply) => reactTo(req, reply, ''),
   )
 
   app.get(
@@ -290,18 +371,16 @@ export async function messageRoutes(app: App) {
     async (req) => {
       const { chat, before, limit = 50 } = req.query
       const res = await query(
-        `SELECT payload, status FROM messages
-          WHERE device_id = $1 AND NOT pending_event
-            AND ($2::text IS NULL OR chat_jid = $2 OR payload->>'chatAlt' = $2)
-            AND ($3::timestamptz IS NULL OR ts < $3)
-          ORDER BY ts DESC, id DESC LIMIT $4`,
+        `SELECT m.payload, m.status, ${REACTIONS_SQL} AS reactions FROM messages m
+          WHERE m.device_id = $1 AND NOT m.pending_event
+            AND ($2::text IS NULL OR m.chat_jid = $2 OR m.payload->>'chatAlt' = $2)
+            AND ($3::timestamptz IS NULL OR m.ts < $3)
+          ORDER BY m.ts DESC, m.id DESC LIMIT $4`,
         [req.device.id, chat ? toJid(chat) : null, before ?? null, limit],
       )
-      return res.rows.map((r) => ({ ...r.payload, status: r.status }))
+      return res.rows.map((r) => ({ ...r.payload, status: r.status, reactions: r.reactions }))
     },
   )
-
-  const MessageParams = Type.Object({ deviceId: Type.String({ format: 'uuid' }), messageId: Type.String() })
 
   app.get(
     '/devices/:deviceId/messages/:messageId',
@@ -315,13 +394,14 @@ export async function messageRoutes(app: App) {
       },
     },
     async (req) => {
-      const res = await query('SELECT payload, status, raw FROM messages WHERE device_id = $1 AND message_id = $2 ORDER BY id LIMIT 1', [
-        req.device.id,
-        req.params.messageId,
-      ])
+      const res = await query(
+        `SELECT m.payload, m.status, m.raw, ${REACTIONS_SQL} AS reactions FROM messages m
+          WHERE m.device_id = $1 AND m.message_id = $2 ORDER BY m.id LIMIT 1`,
+        [req.device.id, req.params.messageId],
+      )
       if (!res.rowCount) throw new HttpError(404, 'message not found')
       const row = res.rows[0]
-      return { ...row.payload, status: row.status, ...(req.query.raw ? { raw: row.raw } : {}) }
+      return { ...row.payload, status: row.status, reactions: row.reactions, ...(req.query.raw ? { raw: row.raw } : {}) }
     },
   )
 
