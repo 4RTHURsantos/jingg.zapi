@@ -36,6 +36,13 @@ curl -X POST localhost:3000/v1/devices/$ID/messages -H "x-api-key: $KEY" -H 'con
 Autenticação pelo header `x-api-key` (ou `Authorization: Bearer`). A chave de administrador acessa tudo;
 a chave de dispositivo só as rotas `/v1/devices/{id}/…` do próprio dispositivo — é a que você entrega a cada projeto.
 
+## Bibliotecas cliente
+
+Para consumir a API sem escrever HTTP na mão — informam-se a URL e a chave:
+
+- **C# / .NET** — [jingg.zapi-dotnet](https://github.com/4RTHURsantos/jingg.zapi-dotnet)
+- **TypeScript / JavaScript** — [jingg.zapi-js](https://github.com/4RTHURsantos/jingg.zapi-js)
+
 ## Arquitetura
 
 ```
